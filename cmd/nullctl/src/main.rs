@@ -9,6 +9,7 @@ use std::process;
 
 const NULLD_SOCKET: &str = "/run/nulld.sock";
 const CAGE_SOCKET: &str = "/run/cage.sock";
+const WARDEN_SOCKET: &str = "/run/warden.sock";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -22,6 +23,7 @@ fn main() {
         "status" => handle_status(),
         "shutdown" => handle_shutdown(),
         "cage" => handle_cage(&args[1..]),
+        "vault" => handle_vault(&args[1..]),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -143,6 +145,78 @@ fn handle_cage(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn handle_vault(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        eprintln!("nullctl vault: missing subcommand");
+        eprintln!();
+        eprintln!("usage:");
+        eprintln!("  nullctl vault list                  List stored secret keys");
+        eprintln!("  nullctl vault set <KEY> <VALUE>      Set a secret");
+        eprintln!("  nullctl vault delete <KEY>            Delete a secret");
+        process::exit(1);
+    }
+
+    match args[0].as_str() {
+        "list" => {
+            let resp = send_to_socket(WARDEN_SOCKET, &serde_json::json!({"method": "list"}))?;
+            let parsed: serde_json::Value = serde_json::from_str(&resp)?;
+
+            if let Some(keys) = parsed.get("keys").and_then(|k| k.as_array()) {
+                if keys.is_empty() {
+                    println!("no secrets stored");
+                } else {
+                    println!("{:<30} {}", "KEY", "STATUS");
+                    for key in keys {
+                        if let Some(name) = key.as_str() {
+                            println!("{:<30} set", name);
+                        }
+                    }
+                }
+            } else if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
+                eprintln!("warden: {err}");
+                process::exit(1);
+            }
+        }
+        "set" => {
+            let key = args.get(1).ok_or("usage: nullctl vault set <KEY> <VALUE>")?;
+            let value = args.get(2).ok_or("usage: nullctl vault set <KEY> <VALUE>")?;
+            let resp = send_to_socket(
+                WARDEN_SOCKET,
+                &serde_json::json!({"method": "set", "key": key, "value": value}),
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&resp)?;
+
+            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                println!("warden: secret '{key}' set");
+            } else if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
+                eprintln!("warden: {err}");
+                process::exit(1);
+            }
+        }
+        "delete" => {
+            let key = args.get(1).ok_or("usage: nullctl vault delete <KEY>")?;
+            let resp = send_to_socket(
+                WARDEN_SOCKET,
+                &serde_json::json!({"method": "delete", "key": key}),
+            )?;
+            let parsed: serde_json::Value = serde_json::from_str(&resp)?;
+
+            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                println!("warden: secret '{key}' deleted");
+            } else if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
+                eprintln!("warden: {err}");
+                process::exit(1);
+            }
+        }
+        other => {
+            eprintln!("nullctl vault: unknown subcommand '{other}'");
+            process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
 fn send_nulld_request(method: &str) -> Result<String, Box<dyn std::error::Error>> {
     let request = serde_json::json!({"method": method});
     send_to_socket(NULLD_SOCKET, &request)
@@ -173,9 +247,12 @@ fn print_usage() {
     eprintln!("nullctl — NullBox CLI");
     eprintln!();
     eprintln!("usage:");
-    eprintln!("  nullctl status              Show service status");
-    eprintln!("  nullctl shutdown            Initiate clean shutdown");
-    eprintln!("  nullctl cage list           List running agent VMs");
-    eprintln!("  nullctl cage start <agent>  Start an agent microVM");
-    eprintln!("  nullctl cage stop <agent>   Stop an agent microVM");
+    eprintln!("  nullctl status                    Show service status");
+    eprintln!("  nullctl shutdown                  Initiate clean shutdown");
+    eprintln!("  nullctl cage list                 List running agent VMs");
+    eprintln!("  nullctl cage start <agent>        Start an agent microVM");
+    eprintln!("  nullctl cage stop <agent>         Stop an agent microVM");
+    eprintln!("  nullctl vault list                List stored secret keys");
+    eprintln!("  nullctl vault set <KEY> <VALUE>   Set a secret");
+    eprintln!("  nullctl vault delete <KEY>        Delete a secret");
 }

@@ -6,6 +6,7 @@ members = [
     "pkg/cage",
     "pkg/egress",
     "pkg/ctxgraph",
+    "pkg/warden",
     "pkg/test-agent",
 ]
 

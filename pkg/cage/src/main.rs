@@ -13,6 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
 const EGRESS_SOCKET: &str = "/run/egress.sock";
+const WARDEN_SOCKET: &str = "/run/warden.sock";
 
 const SOCKET_PATH: &str = "/run/cage.sock";
 const AGENT_DIR: &str = "/agent";
@@ -88,7 +89,8 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         let rootfs_path = format!("{AGENT_ROOTFS_BASE}/{name}");
         let bin_path = format!("{rootfs_path}/agent/bin/{name}");
         if Path::new(&bin_path).exists() {
-            match vm_mgr.start_agent(manifest, &exec_path) {
+            let secrets = request_secrets(name, &manifest.capabilities.credential_refs);
+            match vm_mgr.start_agent(manifest, &exec_path, &secrets) {
                 Ok(pid) => {
                     log(&format!("cage: auto-started '{name}' (PID {pid})"));
                     notify_egress_add(name, &manifest.capabilities.network.allow);
@@ -191,7 +193,10 @@ fn handle_start(
     // The exec_path inside the VM — agent binaries live at /agent/bin/<name>
     let exec_path = format!("/agent/bin/{name}");
 
-    match vm_mgr.start_agent(manifest, &exec_path) {
+    // Fetch agent secrets from warden
+    let secrets = request_secrets(name, &manifest.capabilities.credential_refs);
+
+    match vm_mgr.start_agent(manifest, &exec_path, &secrets) {
         Ok(pid) => {
             log(&format!("cage: started agent '{name}' in VM (PID {pid})"));
 
@@ -257,6 +262,46 @@ fn load_manifests() -> HashMap<String, manifest::AgentManifest> {
     manifests
 }
 
+/// Request agent secrets from the warden vault.
+///
+/// Returns only the secrets matching the agent's credential_refs.
+/// On failure, returns an empty map (warden may not be running during dev).
+fn request_secrets(agent_name: &str, credential_refs: &[String]) -> HashMap<String, String> {
+    if credential_refs.is_empty() {
+        return HashMap::new();
+    }
+
+    let request = serde_json::json!({
+        "method": "get-secrets",
+        "agent": agent_name,
+        "credential_refs": credential_refs,
+    });
+
+    match send_to_service(WARDEN_SOCKET, &request) {
+        Ok(resp) => {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp) {
+                if let Some(secrets) = parsed.get("secrets").and_then(|s| s.as_object()) {
+                    let map: HashMap<String, String> = secrets
+                        .iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect();
+                    log(&format!(
+                        "cage: warden returned {} secret(s) for '{agent_name}'",
+                        map.len()
+                    ));
+                    return map;
+                }
+            }
+            log(&format!("cage: warden unexpected response for '{agent_name}': {resp}"));
+            HashMap::new()
+        }
+        Err(e) => {
+            log(&format!("cage: warden request for '{agent_name}' failed: {e}"));
+            HashMap::new()
+        }
+    }
+}
+
 /// Send add-agent request to egress daemon with the agent's allowed domains.
 fn notify_egress_add(agent_name: &str, domains: &[String]) {
     let request = serde_json::json!({
@@ -265,7 +310,7 @@ fn notify_egress_add(agent_name: &str, domains: &[String]) {
         "domains": domains,
     });
 
-    match send_to_egress(&request) {
+    match send_to_service(EGRESS_SOCKET, &request) {
         Ok(resp) => log(&format!("cage: egress add-agent '{agent_name}': {resp}")),
         Err(e) => log(&format!("cage: egress add-agent '{agent_name}' failed: {e}")),
     }
@@ -278,15 +323,15 @@ fn notify_egress_remove(agent_name: &str) {
         "agent": agent_name,
     });
 
-    match send_to_egress(&request) {
+    match send_to_service(EGRESS_SOCKET, &request) {
         Ok(resp) => log(&format!("cage: egress remove-agent '{agent_name}': {resp}")),
         Err(e) => log(&format!("cage: egress remove-agent '{agent_name}' failed: {e}")),
     }
 }
 
-/// Send a JSON request to the egress Unix socket and read one line of response.
-fn send_to_egress(request: &serde_json::Value) -> Result<String, String> {
-    let mut stream = UnixStream::connect(EGRESS_SOCKET)
+/// Send a JSON request to a Unix socket and read one line of response.
+fn send_to_service(socket_path: &str, request: &serde_json::Value) -> Result<String, String> {
+    let mut stream = UnixStream::connect(socket_path)
         .map_err(|e| format!("connect: {e}"))?;
 
     stream

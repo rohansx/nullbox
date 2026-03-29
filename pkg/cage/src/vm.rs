@@ -39,6 +39,7 @@ impl VmManager {
         &mut self,
         manifest: &AgentManifest,
         exec_path: &str,
+        secrets: &HashMap<String, String>,
     ) -> Result<u32, VmError> {
         let name = &manifest.agent.name;
 
@@ -61,10 +62,16 @@ impl VmManager {
             root_path: rootfs_path,
             exec_path: exec_path.to_string(),
             args: vec![],
-            env: vec![
-                format!("AGENT_NAME={name}"),
-                "CTXGRAPH_PORT=9100".to_string(),
-            ],
+            env: {
+                let mut env = vec![
+                    format!("AGENT_NAME={name}"),
+                    "CTXGRAPH_PORT=9100".to_string(),
+                ];
+                for (k, v) in secrets {
+                    env.push(format!("{k}={v}"));
+                }
+                env
+            },
             // TSI handles outbound transparently — no port map needed
             port_map: vec![],
             workdir: "/".to_string(),

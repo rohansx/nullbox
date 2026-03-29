@@ -58,6 +58,7 @@ copy_binary nulld
 copy_binary nullctl
 copy_binary egress
 copy_binary ctxgraph
+copy_binary warden
 copy_binary cage
 
 # cage links dynamically against libkrun — copy required shared libraries
@@ -136,9 +137,15 @@ args = []
 depends_on = []
 restart = "always"
 
+[service.warden]
+binary = "/system/bin/warden"
+args = []
+depends_on = []
+restart = "always"
+
 [service.cage]
 binary = "/system/bin/cage"
-depends_on = ["egress", "ctxgraph"]
+depends_on = ["egress", "ctxgraph", "warden"]
 restart = "always"
 EOF
 echo "  Created nulld.toml"
