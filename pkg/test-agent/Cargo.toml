@@ -6,3 +6,6 @@ edition.workspace = true
 [[bin]]
 name = "test-agent"
 path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"

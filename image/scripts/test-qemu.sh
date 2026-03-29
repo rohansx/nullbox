@@ -39,6 +39,9 @@ QEMU_COMMON=(
     -nographic
     -serial mon:stdio
     -no-reboot
+    # User-mode networking so TSI in nested libkrun VMs can proxy through
+    -netdev user,id=net0
+    -device virtio-net-pci,netdev=net0
 )
 
 case "${MODE}" in

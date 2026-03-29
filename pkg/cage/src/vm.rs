@@ -61,7 +61,11 @@ impl VmManager {
             root_path: rootfs_path,
             exec_path: exec_path.to_string(),
             args: vec![],
-            env: vec![format!("AGENT_NAME={name}")],
+            env: vec![
+                format!("AGENT_NAME={name}"),
+                "CTXGRAPH_PORT=9100".to_string(),
+            ],
+            // TSI handles outbound transparently — no port map needed
             port_map: vec![],
             workdir: "/".to_string(),
         };

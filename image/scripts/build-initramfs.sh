@@ -61,7 +61,7 @@ fi
 if command -v busybox &>/dev/null; then
     cp "$(command -v busybox)" "${BUILD_DIR}/bin/busybox"
     # Create essential symlinks
-    for cmd in sh ls cat mount umount mkdir switch_root; do
+    for cmd in sh ls cat mount umount mkdir switch_root ip; do
         ln -sf busybox "${BUILD_DIR}/bin/${cmd}"
     done
     echo "  Copied busybox (rescue shell — remove for production)"
@@ -142,6 +142,23 @@ if [ ! -x /newroot/system/bin/nulld ]; then
         exec /bin/sh
     fi
     while true; do sleep 3600; done
+fi
+
+# Configure network interface if present (for TSI proxy in cage microVMs)
+if [ -d /sys/class/net/eth0 ]; then
+    echo "nullbox: configuring network (eth0)"
+    ip link set lo up
+    ip link set eth0 up
+    ip addr add 10.0.2.15/24 dev eth0
+    ip route add default via 10.0.2.2
+    echo "nullbox: network configured (10.0.2.15)"
+elif [ -d /sys/class/net/enp0s3 ]; then
+    echo "nullbox: configuring network (enp0s3)"
+    ip link set lo up
+    ip link set enp0s3 up
+    ip addr add 10.0.2.15/24 dev enp0s3
+    ip route add default via 10.0.2.2
+    echo "nullbox: network configured (10.0.2.15)"
 fi
 
 echo "nullbox: pivoting to SquashFS root"
