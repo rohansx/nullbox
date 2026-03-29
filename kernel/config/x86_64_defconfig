@@ -204,6 +204,54 @@ CONFIG_PACKET=y
 CONFIG_UNIX=y
 
 #
+# === Ethernet NIC drivers (built-in for bare metal) ===
+#
+# Intel (covers most servers + desktops)
+CONFIG_E1000=y
+CONFIG_E1000E=y
+CONFIG_IGB=y
+CONFIG_IGBVF=y
+CONFIG_IXGBE=y
+CONFIG_I40E=y
+CONFIG_ICE=y
+# Realtek (most consumer boards)
+CONFIG_R8169=y
+# Broadcom
+CONFIG_TIGON3=y
+CONFIG_BNX2=y
+CONFIG_BNXT=y
+# Mellanox/NVIDIA ConnectX
+CONFIG_MLX4_EN=y
+CONFIG_MLX5_CORE=y
+CONFIG_MLX5_CORE_EN=y
+# AMD/Pensando
+CONFIG_AMD_XGBE=y
+# Aquantia/Marvell (2.5G/5G/10G on newer boards)
+CONFIG_ATLANTIC=y
+# Generic MII/MDIO for PHY support
+CONFIG_PHYLIB=y
+CONFIG_MDIO_DEVICE=y
+CONFIG_MDIO_BUS=y
+
+#
+# === WiFi (basic support for laptops/edge) ===
+#
+CONFIG_WIRELESS=y
+CONFIG_CFG80211=y
+CONFIG_MAC80211=y
+CONFIG_WLAN=y
+# Intel WiFi (most common)
+CONFIG_IWLWIFI=y
+CONFIG_IWLMVM=y
+# Realtek WiFi
+CONFIG_RTW88=y
+CONFIG_RTW89=y
+# Atheros/Qualcomm
+CONFIG_ATH9K=y
+CONFIG_ATH10K=y
+CONFIG_ATH11K=y
+
+#
 # === Storage drivers (built-in, no modules) ===
 #
 CONFIG_ATA=y

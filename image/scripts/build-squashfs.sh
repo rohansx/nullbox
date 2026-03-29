@@ -33,7 +33,7 @@ mkdir -p "${OUTPUT_DIR}"
 rm -rf "${BUILD_DIR:?}"
 
 # Create filesystem layout (from ARCHITECTURE.md)
-mkdir -p "${BUILD_DIR}"/{system/bin,system/config,etc,tmp,var/lib/ctxgraph,agent,vault,snapshots,proc,sys,dev,run}
+mkdir -p "${BUILD_DIR}"/{system/bin,system/config,etc,tmp,var/lib/ctxgraph,agent,vault,snapshots,proc,sys,dev,run,data}
 mkdir -p "${BUILD_DIR}/dev"/{pts,shm}
 
 # Copy binaries

@@ -150,6 +150,62 @@ fn create_var_dirs() -> Result<(), MountError> {
     Ok(())
 }
 
+/// Attempt to mount a persistent data partition at /data.
+///
+/// Scans block devices for an ext4 partition labeled "nullbox-data".
+/// If found, mounts it at /data and bind-mounts subdirectories so that
+/// vault secrets and ctxgraph state survive reboots.
+///
+/// If no persistent partition exists, /data stays on tmpfs (ephemeral).
+pub fn mount_persistent() {
+    // Scan /dev for block devices
+    let devs = [
+        "/dev/sda1", "/dev/sda2", "/dev/sda3",
+        "/dev/sdb1", "/dev/sdb2",
+        "/dev/nvme0n1p1", "/dev/nvme0n1p2", "/dev/nvme0n1p3",
+        "/dev/vda1", "/dev/vda2",
+    ];
+
+    for dev in &devs {
+        if !std::path::Path::new(dev).exists() {
+            continue;
+        }
+
+        // Try mounting as ext4
+        let result = mount(
+            Some(*dev),
+            "/data",
+            Some("ext4"),
+            MsFlags::MS_NOATIME,
+            None::<&str>,
+        );
+
+        if result.is_ok() {
+            // Check for sentinel file
+            if std::path::Path::new("/data/.nullbox-data").exists() {
+                // Create subdirectories for persistent state
+                let _ = fs::create_dir_all("/data/vault");
+                let _ = fs::create_dir_all("/data/ctxgraph");
+                let _ = fs::create_dir_all("/data/snapshots");
+
+                // Bind-mount /data/vault → /run/warden so warden writes persist
+                let _ = fs::create_dir_all("/run/warden");
+                let _ = mount(
+                    Some("/data/vault"),
+                    "/run/warden",
+                    None::<&str>,
+                    MsFlags::MS_BIND,
+                    None::<&str>,
+                );
+
+                return;
+            }
+            // Not our partition — unmount and try next
+            let _ = nix::mount::umount("/data");
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum MountError {
     MountFailed {

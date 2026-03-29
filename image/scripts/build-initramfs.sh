@@ -61,7 +61,7 @@ fi
 if command -v busybox &>/dev/null; then
     cp "$(command -v busybox)" "${BUILD_DIR}/bin/busybox"
     # Create essential symlinks
-    for cmd in sh ls cat mount umount mkdir switch_root ip; do
+    for cmd in sh ls cat mount umount mkdir switch_root ip udhcpc grep sleep; do
         ln -sf busybox "${BUILD_DIR}/bin/${cmd}"
     done
     echo "  Copied busybox (rescue shell — remove for production)"
@@ -144,21 +144,68 @@ if [ ! -x /newroot/system/bin/nulld ]; then
     while true; do sleep 3600; done
 fi
 
-# Configure network interface if present (for TSI proxy in cage microVMs)
-if [ -d /sys/class/net/eth0 ]; then
-    echo "nullbox: configuring network (eth0)"
-    ip link set lo up
-    ip link set eth0 up
-    ip addr add 10.0.2.15/24 dev eth0
-    ip route add default via 10.0.2.2
-    echo "nullbox: network configured (10.0.2.15)"
-elif [ -d /sys/class/net/enp0s3 ]; then
-    echo "nullbox: configuring network (enp0s3)"
-    ip link set lo up
-    ip link set enp0s3 up
-    ip addr add 10.0.2.15/24 dev enp0s3
-    ip route add default via 10.0.2.2
-    echo "nullbox: network configured (10.0.2.15)"
+# Configure network — find first real NIC and bring it up via DHCP
+ip link set lo up
+
+# Find the first non-loopback network interface
+NETIF=""
+for iface in /sys/class/net/*; do
+    name=$(basename "${iface}")
+    [ "${name}" = "lo" ] && continue
+    [ -d "${iface}" ] || continue
+    NETIF="${name}"
+    break
+done
+
+if [ -n "${NETIF}" ]; then
+    echo "nullbox: configuring network (${NETIF})"
+    ip link set "${NETIF}" up
+
+    # Wait briefly for link to come up
+    sleep 1
+
+    # Try DHCP first (busybox udhcpc)
+    if [ -x /bin/udhcpc ]; then
+        echo "nullbox: running DHCP on ${NETIF}"
+        # Create minimal udhcpc script
+        mkdir -p /usr/share/udhcpc
+        cat > /usr/share/udhcpc/default.script << 'DHCP_SCRIPT'
+#!/bin/sh
+case "$1" in
+    bound|renew)
+        ip addr flush dev "$interface"
+        ip addr add "$ip/${mask:-24}" dev "$interface"
+        if [ -n "$router" ]; then
+            ip route add default via "$router" dev "$interface"
+        fi
+        if [ -n "$dns" ]; then
+            : > /etc/resolv.conf
+            for d in $dns; do
+                echo "nameserver $d" >> /etc/resolv.conf
+            done
+        fi
+        ;;
+esac
+DHCP_SCRIPT
+        chmod +x /usr/share/udhcpc/default.script
+        udhcpc -i "${NETIF}" -n -q -t 5 -T 3 2>/dev/null
+        if [ $? -eq 0 ]; then
+            ADDR=$(ip -4 addr show "${NETIF}" | grep -o 'inet [^ ]*' | head -1 | cut -d' ' -f2)
+            echo "nullbox: network configured via DHCP (${ADDR})"
+        else
+            echo "nullbox: DHCP failed, falling back to static"
+            ip addr add 10.0.2.15/24 dev "${NETIF}"
+            ip route add default via 10.0.2.2
+            echo "nullbox: network configured (10.0.2.15 static fallback)"
+        fi
+    else
+        # No udhcpc — use QEMU-compatible static config
+        ip addr add 10.0.2.15/24 dev "${NETIF}"
+        ip route add default via 10.0.2.2
+        echo "nullbox: network configured (10.0.2.15 static)"
+    fi
+else
+    echo "nullbox: WARNING — no network interface found"
 fi
 
 echo "nullbox: pivoting to SquashFS root"

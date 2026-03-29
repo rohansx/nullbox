@@ -51,6 +51,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     log_kmsg("nulld: mounting filesystems");
     mount::mount_all()?;
 
+    // Phase 1b: Try to mount persistent data partition
+    log_kmsg("nulld: checking for persistent data partition");
+    mount::mount_persistent();
+
     // Phase 2: Set up signal handling (SIGCHLD reaping, SIGTERM shutdown)
     log_kmsg("nulld: installing signal handlers");
     let shutdown_flag = signal::install_handlers()?;
