@@ -94,6 +94,31 @@ if [[ -f "${CAGE_BIN}" ]] && ldd "${CAGE_BIN}" &>/dev/null; then
     echo "  Copied runtime dependencies"
 fi
 
+# Copy nft binary and its shared libraries (needed by egress)
+echo ">>> Copying nftables tooling..."
+NFT_BIN=$(command -v nft 2>/dev/null || true)
+if [[ -n "${NFT_BIN}" ]]; then
+    cp "${NFT_BIN}" "${BUILD_DIR}/system/bin/nft"
+    chmod +x "${BUILD_DIR}/system/bin/nft"
+    echo "  Copied nft"
+    # Copy nft's shared library dependencies
+    ldd "${NFT_BIN}" 2>/dev/null | grep "=> /" | awk '{print $3}' | while read -r lib; do
+        BASENAME=$(basename "${lib}")
+        if [[ ! -f "${BUILD_DIR}/usr/lib/${BASENAME}" ]]; then
+            cp "${lib}" "${BUILD_DIR}/usr/lib/"
+            echo "  Copied ${BASENAME}"
+        fi
+    done
+    # Ensure dynamic linker is present
+    if [[ -f /lib64/ld-linux-x86-64.so.2 ]] && [[ ! -f "${BUILD_DIR}/lib64/ld-linux-x86-64.so.2" ]]; then
+        mkdir -p "${BUILD_DIR}/lib64"
+        cp /lib64/ld-linux-x86-64.so.2 "${BUILD_DIR}/lib64/"
+        echo "  Copied ld-linux"
+    fi
+else
+    echo "  WARNING: nft not found — egress cannot apply rules at runtime"
+fi
+
 # Create nulld.toml service configuration
 cat > "${BUILD_DIR}/system/config/nulld.toml" << 'EOF'
 # NullBox v0.1 service configuration

@@ -225,8 +225,17 @@ fn regenerate_and_apply(
 }
 
 fn apply_ruleset() -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new("nft")
+    // Use absolute path — nft lives at /system/bin/nft in the SquashFS image.
+    // Fall back to PATH for development/testing outside the image.
+    let nft_bin = if Path::new("/system/bin/nft").exists() {
+        "/system/bin/nft"
+    } else {
+        "nft"
+    };
+
+    let output = Command::new(nft_bin)
         .args(["-f", NFT_RULES_PATH])
+        .env("LD_LIBRARY_PATH", "/usr/lib")
         .output();
 
     match output {
