@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "nulld",
-    "cage",
-    "egress",
-    "ctxgraph",
-    "nullctl",
+    "cmd/nulld",
+    "cmd/nullctl",
+    "pkg/cage",
+    "pkg/egress",
+    "pkg/ctxgraph",
 ]
 
 [workspace.package]
