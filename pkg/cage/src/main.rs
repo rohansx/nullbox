@@ -9,8 +9,10 @@ use cage::manifest;
 use cage::vm::VmManager;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+
+const EGRESS_SOCKET: &str = "/run/egress.sock";
 
 const SOCKET_PATH: &str = "/run/cage.sock";
 const AGENT_DIR: &str = "/agent";
@@ -87,7 +89,10 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         let bin_path = format!("{rootfs_path}/agent/bin/{name}");
         if Path::new(&bin_path).exists() {
             match vm_mgr.start_agent(manifest, &exec_path) {
-                Ok(pid) => log(&format!("cage: auto-started '{name}' (PID {pid})")),
+                Ok(pid) => {
+                    log(&format!("cage: auto-started '{name}' (PID {pid})"));
+                    notify_egress_add(name, &manifest.capabilities.network.allow);
+                }
                 Err(e) => log(&format!("cage: failed to auto-start '{name}': {e}")),
             }
         } else {
@@ -189,6 +194,10 @@ fn handle_start(
     match vm_mgr.start_agent(manifest, &exec_path) {
         Ok(pid) => {
             log(&format!("cage: started agent '{name}' in VM (PID {pid})"));
+
+            // Notify egress to allow this agent's declared domains
+            notify_egress_add(name, &manifest.capabilities.network.allow);
+
             serde_json::json!({"ok": true, "pid": pid})
         }
         Err(e) => serde_json::json!({"error": e.to_string()}),
@@ -202,6 +211,10 @@ fn handle_stop(
     match vm_mgr.stop_agent(name) {
         Ok(()) => {
             log(&format!("cage: stopped agent '{name}'"));
+
+            // Notify egress to revoke this agent's network access
+            notify_egress_remove(name);
+
             serde_json::json!({"ok": true})
         }
         Err(e) => serde_json::json!({"error": e.to_string()}),
@@ -242,6 +255,58 @@ fn load_manifests() -> HashMap<String, manifest::AgentManifest> {
     }
 
     manifests
+}
+
+/// Send add-agent request to egress daemon with the agent's allowed domains.
+fn notify_egress_add(agent_name: &str, domains: &[String]) {
+    let request = serde_json::json!({
+        "method": "add-agent",
+        "agent": agent_name,
+        "domains": domains,
+    });
+
+    match send_to_egress(&request) {
+        Ok(resp) => log(&format!("cage: egress add-agent '{agent_name}': {resp}")),
+        Err(e) => log(&format!("cage: egress add-agent '{agent_name}' failed: {e}")),
+    }
+}
+
+/// Send remove-agent request to egress daemon.
+fn notify_egress_remove(agent_name: &str) {
+    let request = serde_json::json!({
+        "method": "remove-agent",
+        "agent": agent_name,
+    });
+
+    match send_to_egress(&request) {
+        Ok(resp) => log(&format!("cage: egress remove-agent '{agent_name}': {resp}")),
+        Err(e) => log(&format!("cage: egress remove-agent '{agent_name}' failed: {e}")),
+    }
+}
+
+/// Send a JSON request to the egress Unix socket and read one line of response.
+fn send_to_egress(request: &serde_json::Value) -> Result<String, String> {
+    let mut stream = UnixStream::connect(EGRESS_SOCKET)
+        .map_err(|e| format!("connect: {e}"))?;
+
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_millis(500)))
+        .ok();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(2000)))
+        .ok();
+
+    let msg = serde_json::to_string(request).map_err(|e| format!("serialize: {e}"))?;
+    writeln!(stream, "{msg}").map_err(|e| format!("write: {e}"))?;
+    stream.flush().map_err(|e| format!("flush: {e}"))?;
+
+    let mut reader = BufReader::new(&stream);
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .map_err(|e| format!("read: {e}"))?;
+
+    Ok(response.trim().to_string())
 }
 
 fn log(msg: &str) {

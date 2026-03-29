@@ -14,10 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-log = "0.4"
-thiserror = "2"
-hickory-resolver = "0.25"
-ipnet = "2"
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

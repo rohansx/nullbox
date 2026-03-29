@@ -6,7 +6,4 @@
 
 pub mod blocklist;
 pub mod firewall;
-
-// DNS resolver with IP binding will be implemented when we integrate
-// with the actual nftables runtime:
-// pub mod dns;
+pub mod resolve;
