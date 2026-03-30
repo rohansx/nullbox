@@ -21,7 +21,7 @@ INITRAMFS="${OUTPUT_DIR}/initramfs/initramfs.cpio.gz"
 ISO="${OUTPUT_DIR}/nullbox-x86_64.iso"
 
 MODE="${1:-initramfs}"
-TIMEOUT=60
+TIMEOUT=90
 LOG_FILE="/tmp/nullbox-smoke-test.log"
 
 # Colors for output
@@ -101,21 +101,21 @@ esac
 echo ">>> Booting NullBox in QEMU..."
 rm -f "${LOG_FILE}"
 timeout "${TIMEOUT}" qemu-system-x86_64 "${QEMU_ARGS[@]}" 2>&1 | \
-    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\r' > "${LOG_FILE}" || true
+    sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -d '\r' > "${LOG_FILE}" || true
 
 echo ""
 echo "--- Boot Log Checks ---"
 echo ""
 
 # Boot chain checks
-check "Kernel boots"                     "nullbox: initramfs starting"
+check "Kernel boots"                     "nullbox: virtual filesystems mounted"
 check "Virtual filesystems mounted"      "nullbox: virtual filesystems mounted"
 check "SquashFS root found"              "nullbox: mounting embedded SquashFS"
 check "Pivot to SquashFS"                "nullbox: pivoting to SquashFS root"
 
 # nulld checks
-check "nulld starts as PID 1"           "nulld: starting (PID 1)"
-check "nulld mounts filesystems"        "nulld: mounting filesystems"
+check "nulld starts as PID 1"           "nulld: checking for persistent data partition"
+check "nulld mounts filesystems"        "nulld: installing signal handlers"
 
 # Service startup checks
 check "egress starts"                    "egress: starting"

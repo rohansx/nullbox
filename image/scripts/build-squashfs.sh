@@ -13,8 +13,19 @@
 
 set -euo pipefail
 
+PRODUCTION=0
+for arg in "$@"; do
+    case "${arg}" in
+        --production) PRODUCTION=1 ;;
+        --arch=*) ARCH="${arg#*=}" ;;
+    esac
+done
+
 NULLBOX_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-TARGET="${TARGET:-x86_64-unknown-linux-musl}"
+TARGET="${ARCH:-${TARGET:-x86_64-unknown-linux-musl}}"
+if [[ -n "${ARCH:-}" ]]; then
+    TARGET="${ARCH}-unknown-linux-musl"
+fi
 BUILD_DIR="${NULLBOX_ROOT}/build/squashfs-staging"
 OUTPUT_DIR="${NULLBOX_ROOT}/build/output/squashfs"
 
@@ -162,9 +173,10 @@ HOME_URL="https://github.com/nullbox-os/nullbox"
 EOF
 echo "  Created /etc files"
 
-# Create example AGENT.toml for testing
-mkdir -p "${BUILD_DIR}/agent"
-cat > "${BUILD_DIR}/agent/test-agent.toml" << 'EOF'
+# Create example AGENT.toml for testing (dev only)
+if [[ "${PRODUCTION}" != "1" ]]; then
+    mkdir -p "${BUILD_DIR}/agent"
+    cat > "${BUILD_DIR}/agent/test-agent.toml" << 'EOF'
 [agent]
 name = "test-agent"
 version = "0.1.0"
@@ -180,28 +192,52 @@ allow = ["httpbin.org"]
 read = ["/data"]
 write = ["/data/output"]
 EOF
-echo "  Created test AGENT.toml"
+    echo "  Created test AGENT.toml"
 
-# Build and install test-agent rootfs
-echo ">>> Preparing test-agent rootfs..."
-TEST_AGENT_BIN="${RELEASE_DIR}/test-agent"
-if [[ ! -f "${TEST_AGENT_BIN}" ]]; then
-    TEST_AGENT_BIN="${NULLBOX_ROOT}/target/${TARGET}/release/test-agent"
-fi
-if [[ -f "${TEST_AGENT_BIN}" ]]; then
-    AGENT_ROOTFS="${BUILD_DIR}/system/rootfs/test-agent"
-    chmod +x "${NULLBOX_ROOT}/image/scripts/prepare-agent-rootfs.sh"
-    "${NULLBOX_ROOT}/image/scripts/prepare-agent-rootfs.sh" test-agent "${TEST_AGENT_BIN}" "${AGENT_ROOTFS}"
-else
-    echo "  WARNING: test-agent binary not found, skipping rootfs"
+    # Build and install test-agent rootfs
+    echo ">>> Preparing test-agent rootfs..."
+    TEST_AGENT_BIN="${RELEASE_DIR}/test-agent"
+    if [[ ! -f "${TEST_AGENT_BIN}" ]]; then
+        TEST_AGENT_BIN="${NULLBOX_ROOT}/target/${TARGET}/release/test-agent"
+    fi
+    if [[ -f "${TEST_AGENT_BIN}" ]]; then
+        AGENT_ROOTFS="${BUILD_DIR}/system/rootfs/test-agent"
+        chmod +x "${NULLBOX_ROOT}/image/scripts/prepare-agent-rootfs.sh"
+        "${NULLBOX_ROOT}/image/scripts/prepare-agent-rootfs.sh" test-agent "${TEST_AGENT_BIN}" "${AGENT_ROOTFS}"
+    else
+        echo "  WARNING: test-agent binary not found, skipping rootfs"
+    fi
 fi
 
-# Generate warden master key for dev/testing
-echo ">>> Generating warden master key..."
-mkdir -p "${BUILD_DIR}/vault"
-dd if=/dev/urandom bs=32 count=1 2>/dev/null > "${BUILD_DIR}/vault/master.key"
-chmod 600 "${BUILD_DIR}/vault/master.key"
-echo "  Generated /vault/master.key (32 bytes, dev only — use sealed secrets in production)"
+# Generate warden master key for dev/testing (not for production)
+if [[ "${PRODUCTION}" != "1" ]]; then
+    echo ">>> Generating warden master key..."
+    mkdir -p "${BUILD_DIR}/vault"
+    dd if=/dev/urandom bs=32 count=1 2>/dev/null > "${BUILD_DIR}/vault/master.key"
+    chmod 600 "${BUILD_DIR}/vault/master.key"
+    echo "  Generated /vault/master.key (32 bytes, dev only — use sealed secrets in production)"
+fi
+
+# Tighten permissions
+echo ">>> Tightening permissions..."
+chmod 500 "${BUILD_DIR}/system/bin/"*
+chmod 644 "${BUILD_DIR}/system/config/nulld.toml"
+chmod 755 "${BUILD_DIR}/etc"
+chmod 644 "${BUILD_DIR}/etc/"*
+if [[ -d "${BUILD_DIR}/vault" ]]; then
+    chmod 700 "${BUILD_DIR}/vault"
+fi
+
+# Production safety checks
+if [[ "${PRODUCTION}" == "1" ]]; then
+    KEY_FILES=$(find "${BUILD_DIR}" -name "*.key" 2>/dev/null || true)
+    if [[ -n "${KEY_FILES}" ]]; then
+        echo "error: production build contains key files:"
+        echo "${KEY_FILES}"
+        exit 1
+    fi
+    echo "  Mode: PRODUCTION (no test-agent, no dev keys)"
+fi
 
 # Build SquashFS image with zstd compression
 echo ">>> Building SquashFS image..."

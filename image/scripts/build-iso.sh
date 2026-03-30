@@ -15,12 +15,21 @@
 
 set -euo pipefail
 
+PRODUCTION=0
+ARCH="x86_64"
+for arg in "$@"; do
+    case "${arg}" in
+        --production) PRODUCTION=1 ;;
+        --arch=*) ARCH="${arg#*=}" ;;
+    esac
+done
+
 NULLBOX_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD_DIR="${NULLBOX_ROOT}/build/iso-staging"
 OUTPUT_DIR="${NULLBOX_ROOT}/build/output"
-VMLINUZ="${OUTPUT_DIR}/kernel/x86_64/vmlinuz"
+VMLINUZ="${OUTPUT_DIR}/kernel/${ARCH}/vmlinuz"
 INITRAMFS="${OUTPUT_DIR}/initramfs/initramfs.cpio.gz"
-ISO_OUTPUT="${OUTPUT_DIR}/nullbox-x86_64.iso"
+ISO_OUTPUT="${OUTPUT_DIR}/nullbox-${ARCH}.iso"
 
 echo "=== NullBox ISO Build ==="
 
@@ -49,7 +58,13 @@ cp "${VMLINUZ}" "${BUILD_DIR}/boot/vmlinuz"
 cp "${INITRAMFS}" "${BUILD_DIR}/boot/initramfs.cpio.gz"
 
 # Create GRUB config
-cat > "${BUILD_DIR}/boot/grub/grub.cfg" << 'EOF'
+if [[ "${PRODUCTION}" == "1" ]]; then
+    EXTRA_CMDLINE=" nullbox.production=1"
+else
+    EXTRA_CMDLINE=""
+fi
+
+cat > "${BUILD_DIR}/boot/grub/grub.cfg" << GRUB_EOF
 serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1
 terminal_input serial console
 terminal_output serial console
@@ -58,20 +73,25 @@ set timeout=3
 set default=0
 
 menuentry "NullBox v0.1" {
-    linux /boot/vmlinuz console=ttyS0,115200 console=tty0 loglevel=4
+    linux /boot/vmlinuz console=ttyS0,115200 console=tty0 loglevel=4${EXTRA_CMDLINE}
     initrd /boot/initramfs.cpio.gz
 }
 
 menuentry "NullBox v0.1 (verbose)" {
-    linux /boot/vmlinuz console=ttyS0,115200 console=tty0 loglevel=7 earlyprintk=serial
+    linux /boot/vmlinuz console=ttyS0,115200 console=tty0 loglevel=7 earlyprintk=serial${EXTRA_CMDLINE}
     initrd /boot/initramfs.cpio.gz
 }
+GRUB_EOF
+
+if [[ "${PRODUCTION}" != "1" ]]; then
+    cat >> "${BUILD_DIR}/boot/grub/grub.cfg" << 'GRUB_EOF'
 
 menuentry "NullBox v0.1 (rescue)" {
     linux /boot/vmlinuz console=ttyS0,115200 console=tty0 loglevel=7 nullbox.rescue=1
     initrd /boot/initramfs.cpio.gz
 }
-EOF
+GRUB_EOF
+fi
 
 # Build ISO with grub-mkrescue (handles both BIOS and EFI)
 echo ">>> Building ISO..."

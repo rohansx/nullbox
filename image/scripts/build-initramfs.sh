@@ -15,6 +15,16 @@
 
 set -euo pipefail
 
+PRODUCTION=0
+ARCH="x86_64"
+for arg in "$@"; do
+    case "${arg}" in
+        --production) PRODUCTION=1 ;;
+        --arch=*) ARCH="${arg#*=}" ;;
+    esac
+done
+TARGET="${ARCH}-unknown-linux-musl"
+
 NULLBOX_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BUILD_DIR="${NULLBOX_ROOT}/build/initramfs"
 OUTPUT_DIR="${NULLBOX_ROOT}/build/output/initramfs"
@@ -32,17 +42,26 @@ mkdir -p "${BUILD_DIR}"/{bin,dev,proc,sys,mnt/root,newroot,tmp}
 
 # Create device nodes (need root or fakeroot)
 # These are essential for early boot before devtmpfs is mounted
-if [[ $EUID -eq 0 ]]; then
+if command -v fakeroot &>/dev/null; then
+    fakeroot -- bash -c "
+        mknod -m 622 '${BUILD_DIR}/dev/console' c 5 1
+        mknod -m 666 '${BUILD_DIR}/dev/null' c 1 3
+        mknod -m 666 '${BUILD_DIR}/dev/zero' c 1 5
+        mknod -m 666 '${BUILD_DIR}/dev/tty' c 5 0
+    "
+    echo "  Created device nodes (fakeroot)"
+elif [[ $EUID -eq 0 ]]; then
     mknod -m 622 "${BUILD_DIR}/dev/console" c 5 1
     mknod -m 666 "${BUILD_DIR}/dev/null" c 1 3
     mknod -m 666 "${BUILD_DIR}/dev/zero" c 1 5
     mknod -m 666 "${BUILD_DIR}/dev/tty" c 5 0
+    echo "  Created device nodes (root)"
 else
-    echo "  (skipping device nodes — run as root or use fakeroot for production builds)"
+    echo "  (skipping device nodes — install fakeroot or run as root)"
 fi
 
 # Copy nulld binary (statically linked)
-NULLD_BIN="${NULLBOX_ROOT}/target/x86_64-unknown-linux-musl/release/nulld"
+NULLD_BIN="${NULLBOX_ROOT}/target/${TARGET}/release/nulld"
 if [[ -f "${NULLD_BIN}" ]]; then
     cp "${NULLD_BIN}" "${BUILD_DIR}/bin/nulld"
     echo "  Copied nulld (musl static binary)"
@@ -58,13 +77,15 @@ else
 fi
 
 # Copy busybox for rescue/debug (removed in production builds)
-if command -v busybox &>/dev/null; then
-    cp "$(command -v busybox)" "${BUILD_DIR}/bin/busybox"
-    # Create essential symlinks
-    for cmd in sh ls cat mount umount mkdir switch_root ip udhcpc grep sleep; do
-        ln -sf busybox "${BUILD_DIR}/bin/${cmd}"
-    done
-    echo "  Copied busybox (rescue shell — remove for production)"
+if [[ "${PRODUCTION}" != "1" ]]; then
+    if command -v busybox &>/dev/null; then
+        cp "$(command -v busybox)" "${BUILD_DIR}/bin/busybox"
+        # Create essential symlinks
+        for cmd in sh ls cat mount umount mkdir switch_root ip udhcpc grep sleep; do
+            ln -sf busybox "${BUILD_DIR}/bin/${cmd}"
+        done
+        echo "  Copied busybox (rescue shell — remove for production)"
+    fi
 fi
 
 # Copy SquashFS image into initramfs if it exists
@@ -85,28 +106,30 @@ cat > "${BUILD_DIR}/init" << 'INIT_EOF'
 # Mounts SquashFS root, pivots, execs nulld as PID 1.
 #
 
-echo "nullbox: initramfs starting"
+# Log to kernel ring buffer so messages appear on serial console
+log() { echo "$1" > /dev/kmsg 2>/dev/null || echo "$1"; }
 
 # Mount essential virtual filesystems
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 
-echo "nullbox: virtual filesystems mounted"
+log "nullbox: initramfs starting"
+log "nullbox: virtual filesystems mounted"
 
 # Find and mount the SquashFS root
 SQUASHFS_FOUND=0
 
 # Option 1: SquashFS embedded in initramfs
 if [ -f /nullbox.squashfs ]; then
-    echo "nullbox: mounting embedded SquashFS root"
+    log "nullbox: mounting embedded SquashFS root"
     mount -t squashfs -o ro,loop /nullbox.squashfs /newroot
     SQUASHFS_FOUND=1
 fi
 
 # Option 2: SquashFS on a labeled partition
 if [ "${SQUASHFS_FOUND}" -eq 0 ]; then
-    echo "nullbox: searching for SquashFS partition (LABEL=nullbox-root)..."
+    log "nullbox: searching for SquashFS partition (LABEL=nullbox-root)..."
 
     # Wait for devices to settle
     sleep 1
@@ -116,7 +139,7 @@ if [ "${SQUASHFS_FOUND}" -eq 0 ]; then
         [ -b "${dev}" ] || continue
         if mount -t squashfs -o ro "${dev}" /newroot 2>/dev/null; then
             if [ -f /newroot/system/bin/nulld ]; then
-                echo "nullbox: found SquashFS root on ${dev}"
+                log "nullbox: found SquashFS root on ${dev}"
                 SQUASHFS_FOUND=1
                 break
             fi
@@ -126,8 +149,8 @@ if [ "${SQUASHFS_FOUND}" -eq 0 ]; then
 fi
 
 if [ "${SQUASHFS_FOUND}" -eq 0 ]; then
-    echo "nullbox: ERROR — cannot find SquashFS root!"
-    echo "nullbox: dropping to rescue shell (if available)"
+    log "nullbox: ERROR — cannot find SquashFS root!"
+    log "nullbox: dropping to rescue shell (if available)"
     if [ -x /bin/sh ]; then
         exec /bin/sh
     fi
@@ -137,7 +160,7 @@ fi
 
 # Verify nulld exists in the new root
 if [ ! -x /newroot/system/bin/nulld ]; then
-    echo "nullbox: ERROR — /system/bin/nulld not found in SquashFS root!"
+    log "nullbox: ERROR — /system/bin/nulld not found in SquashFS root!"
     if [ -x /bin/sh ]; then
         exec /bin/sh
     fi
@@ -158,7 +181,7 @@ for iface in /sys/class/net/*; do
 done
 
 if [ -n "${NETIF}" ]; then
-    echo "nullbox: configuring network (${NETIF})"
+    log "nullbox: configuring network (${NETIF})"
     ip link set "${NETIF}" up
 
     # Wait briefly for link to come up
@@ -166,7 +189,7 @@ if [ -n "${NETIF}" ]; then
 
     # Try DHCP first (busybox udhcpc)
     if [ -x /bin/udhcpc ]; then
-        echo "nullbox: running DHCP on ${NETIF}"
+        log "nullbox: running DHCP on ${NETIF}"
         # Create minimal udhcpc script
         mkdir -p /usr/share/udhcpc
         cat > /usr/share/udhcpc/default.script << 'DHCP_SCRIPT'
@@ -191,24 +214,24 @@ DHCP_SCRIPT
         udhcpc -i "${NETIF}" -n -q -t 5 -T 3 2>/dev/null
         if [ $? -eq 0 ]; then
             ADDR=$(ip -4 addr show "${NETIF}" | grep -o 'inet [^ ]*' | head -1 | cut -d' ' -f2)
-            echo "nullbox: network configured via DHCP (${ADDR})"
+            log "nullbox: network configured via DHCP (${ADDR})"
         else
-            echo "nullbox: DHCP failed, falling back to static"
+            log "nullbox: DHCP failed, falling back to static"
             ip addr add 10.0.2.15/24 dev "${NETIF}"
             ip route add default via 10.0.2.2
-            echo "nullbox: network configured (10.0.2.15 static fallback)"
+            log "nullbox: network configured (10.0.2.15 static fallback)"
         fi
     else
         # No udhcpc — use QEMU-compatible static config
         ip addr add 10.0.2.15/24 dev "${NETIF}"
         ip route add default via 10.0.2.2
-        echo "nullbox: network configured (10.0.2.15 static)"
+        log "nullbox: network configured (10.0.2.15 static)"
     fi
 else
-    echo "nullbox: WARNING — no network interface found"
+    log "nullbox: WARNING — no network interface found"
 fi
 
-echo "nullbox: pivoting to SquashFS root"
+log "nullbox: pivoting to SquashFS root"
 
 # Clean up initramfs mounts before pivot
 umount /proc 2>/dev/null
@@ -219,7 +242,7 @@ umount /dev 2>/dev/null
 exec switch_root /newroot /system/bin/nulld
 
 # If switch_root fails, we end up here
-echo "nullbox: FATAL — switch_root failed!"
+log "nullbox: FATAL — switch_root failed!"
 while true; do sleep 3600; done
 INIT_EOF
 
@@ -237,3 +260,6 @@ echo ""
 echo "=== initramfs build complete ==="
 echo "  Output: ${OUTPUT_DIR}/initramfs.cpio.gz"
 echo "  Size:   ${INITRAMFS_SIZE}"
+if [[ "${PRODUCTION}" == "1" ]]; then
+    echo "  Mode:    PRODUCTION (no busybox)"
+fi
