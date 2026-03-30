@@ -20,7 +20,12 @@ if [[ ! -f "${BINARY}" ]]; then
 fi
 
 # Create minimal rootfs layout
+# libkrun's init.krun handles /proc, /sys, /dev mounts inside the guest
 mkdir -p "${ROOTFS}"/{agent/bin,tmp,proc,sys,dev,etc,run}
+
+# Create mount points for virtiofs shares declared in AGENT.toml
+# Default dirs that agents commonly declare in capabilities.filesystem
+mkdir -p "${ROOTFS}"/{data,data/output}
 
 # Copy the agent binary
 cp "${BINARY}" "${ROOTFS}/agent/bin/${AGENT_NAME}"

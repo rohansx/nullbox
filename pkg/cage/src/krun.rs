@@ -22,7 +22,17 @@ unsafe extern "C" {
         envp: *const *const c_char,
     ) -> i32;
     fn krun_set_port_map(ctx_id: u32, port_map: *const *const c_char) -> i32;
+    fn krun_add_virtiofs(ctx_id: u32, tag: *const c_char, path: *const c_char) -> i32;
+    fn krun_set_rlimits(ctx_id: u32, rlimits: *const *const c_char) -> i32;
+    fn krun_set_console_output(ctx_id: u32, filepath: *const c_char) -> i32;
     fn krun_start_enter(ctx_id: u32) -> i32;
+}
+
+/// A host directory shared into the guest via virtio-fs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VirtiofsMount {
+    pub tag: String,
+    pub host_path: String,
 }
 
 /// Configuration for a single agent microVM.
@@ -37,6 +47,12 @@ pub struct VmConfig {
     pub env: Vec<String>,
     pub port_map: Vec<String>,
     pub workdir: String,
+    #[serde(default)]
+    pub virtiofs_mounts: Vec<VirtiofsMount>,
+    #[serde(default)]
+    pub rlimits: Vec<String>,
+    #[serde(default)]
+    pub console_output: Option<String>,
 }
 
 /// Errors from libkrun operations.
@@ -54,6 +70,12 @@ pub enum KrunError {
     StartEnter(i32),
     #[error("nul byte in string: {0}")]
     NulError(#[from] std::ffi::NulError),
+    #[error("krun_add_virtiofs failed: {0}")]
+    AddVirtiofs(i32),
+    #[error("krun_set_rlimits failed: {0}")]
+    SetRlimits(i32),
+    #[error("krun_set_console_output failed: {0}")]
+    SetConsoleOutput(i32),
     #[error("libkrun call failed: {0}")]
     Other(String),
 }
@@ -119,6 +141,44 @@ pub fn run_vm(config: &VmConfig) -> Result<(), KrunError> {
             }
         }
 
+        // Share host directories into guest via virtio-fs
+        for mount in &config.virtiofs_mounts {
+            let tag = CString::new(mount.tag.as_str())?;
+            let path = CString::new(mount.host_path.as_str())?;
+            let ret = krun_add_virtiofs(ctx, tag.as_ptr(), path.as_ptr());
+            if ret < 0 {
+                krun_free_ctx(ctx);
+                return Err(KrunError::AddVirtiofs(ret));
+            }
+        }
+
+        // Set resource limits (RLIMIT_AS, RLIMIT_NPROC, etc.)
+        if !config.rlimits.is_empty() {
+            let c_rlimits: Vec<CString> = config
+                .rlimits
+                .iter()
+                .map(|r| CString::new(r.as_str()))
+                .collect::<Result<_, _>>()?;
+            let mut rlimit_ptrs: Vec<*const c_char> =
+                c_rlimits.iter().map(|r| r.as_ptr()).collect();
+            rlimit_ptrs.push(ptr::null());
+            let ret = krun_set_rlimits(ctx, rlimit_ptrs.as_ptr());
+            if ret < 0 {
+                krun_free_ctx(ctx);
+                return Err(KrunError::SetRlimits(ret));
+            }
+        }
+
+        // Route console output to per-agent log file
+        if let Some(ref console_path) = config.console_output {
+            let path = CString::new(console_path.as_str())?;
+            let ret = krun_set_console_output(ctx, path.as_ptr());
+            if ret < 0 {
+                krun_free_ctx(ctx);
+                return Err(KrunError::SetConsoleOutput(ret));
+            }
+        }
+
         // Set executable, args, and environment
         let exec = CString::new(config.exec_path.as_str())?;
 
@@ -154,5 +214,92 @@ pub fn run_vm(config: &VmConfig) -> Result<(), KrunError> {
         // Start VM — this call never returns on success
         let ret = krun_start_enter(ctx);
         Err(KrunError::StartEnter(ret))
+    }
+}
+
+/// Sanitize a filesystem path into a valid virtiofs tag.
+///
+/// `/data/research` → `data_research`
+/// `/var/lib/my-data` → `var_lib_my_data`
+pub fn path_to_virtiofs_tag(path: &str) -> String {
+    path.trim_start_matches('/')
+        .replace(['/', '-', '.'], "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vmconfig_roundtrip_with_new_fields() {
+        let config = VmConfig {
+            name: "test".to_string(),
+            vcpus: 2,
+            ram_mib: 512,
+            root_path: "/rootfs".to_string(),
+            exec_path: "/agent/bin/test".to_string(),
+            args: vec![],
+            env: vec!["FOO=bar".to_string()],
+            port_map: vec![],
+            workdir: "/".to_string(),
+            virtiofs_mounts: vec![
+                VirtiofsMount {
+                    tag: "data_research".to_string(),
+                    host_path: "/var/lib/cage/test/data/research".to_string(),
+                },
+            ],
+            rlimits: vec![
+                "RLIMIT_AS=536870912:536870912".to_string(),
+                "RLIMIT_NPROC=64:64".to_string(),
+            ],
+            console_output: Some("/var/log/cage/test.log".to_string()),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: VmConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.name, "test");
+        assert_eq!(deserialized.virtiofs_mounts.len(), 1);
+        assert_eq!(deserialized.virtiofs_mounts[0].tag, "data_research");
+        assert_eq!(deserialized.rlimits.len(), 2);
+        assert_eq!(
+            deserialized.console_output,
+            Some("/var/log/cage/test.log".to_string())
+        );
+    }
+
+    #[test]
+    fn vmconfig_backwards_compatible() {
+        // Old-style JSON without new fields should deserialize with defaults
+        let json = r#"{
+            "name": "old",
+            "vcpus": 1,
+            "ram_mib": 256,
+            "root_path": "/rootfs",
+            "exec_path": "/bin/agent",
+            "args": [],
+            "env": [],
+            "port_map": [],
+            "workdir": "/"
+        }"#;
+
+        let config: VmConfig = serde_json::from_str(json).unwrap();
+        assert!(config.virtiofs_mounts.is_empty());
+        assert!(config.rlimits.is_empty());
+        assert!(config.console_output.is_none());
+    }
+
+    #[test]
+    fn path_to_tag_sanitization() {
+        assert_eq!(path_to_virtiofs_tag("/data/research"), "data_research");
+        assert_eq!(
+            path_to_virtiofs_tag("/var/lib/my-data"),
+            "var_lib_my_data"
+        );
+        assert_eq!(path_to_virtiofs_tag("/data"), "data");
+        assert_eq!(
+            path_to_virtiofs_tag("/data/.hidden/output"),
+            "data__hidden_output"
+        );
     }
 }

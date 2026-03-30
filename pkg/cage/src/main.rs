@@ -6,7 +6,7 @@
 
 use cage::krun::{self, VmConfig};
 use cage::manifest;
-use cage::vm::VmManager;
+use cage::vm::{self, VmManager};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -55,9 +55,12 @@ fn run_vm_child(config_json: &str) {
     }
 }
 
-/// Daemon mode: scan manifests, listen for commands.
+/// Daemon mode: scan manifests, listen for commands, reap children.
 fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     log("cage: starting microVM manager");
+
+    // Create log directory for per-agent console output
+    let _ = std::fs::create_dir_all("/var/log/cage");
 
     // Check for KVM support
     if Path::new("/dev/kvm").exists() {
@@ -79,8 +82,9 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::remove_file(sock_path)?;
     }
 
-    // Listen for lifecycle commands
+    // Listen for lifecycle commands (non-blocking for SIGCHLD interleaving)
     let listener = UnixListener::bind(SOCKET_PATH)?;
+    listener.set_nonblocking(true)?;
     log(&format!("cage: listening on {SOCKET_PATH}"));
 
     // Auto-start all agents that have a valid rootfs
@@ -102,18 +106,94 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    // Main loop: accept socket commands + reap dead children
+    loop {
+        // Reap any exited child processes (non-blocking)
+        reap_children(&mut vm_mgr, &manifests);
+
+        // Try to accept a connection (non-blocking)
+        match listener.accept() {
+            Ok((stream, _)) => {
                 handle_command(&stream, &mut vm_mgr, &manifests);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No pending connections — sleep briefly to avoid busy-wait
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
                 log(&format!("cage: accept error: {e}"));
             }
         }
     }
+}
 
-    Ok(())
+/// Reap all exited child processes via waitpid(WNOHANG).
+///
+/// On crash (non-zero exit), restarts the agent after a brief delay.
+fn reap_children(
+    vm_mgr: &mut VmManager,
+    manifests: &HashMap<String, manifest::AgentManifest>,
+) {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use nix::unistd::Pid;
+
+    loop {
+        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(pid, status)) => {
+                let pid_u32 = pid.as_raw() as u32;
+                if let Some(exit) = vm_mgr.handle_exit(pid_u32, status) {
+                    log(&format!(
+                        "cage: agent '{}' exited (status {})",
+                        exit.agent_name, exit.exit_status
+                    ));
+                    notify_egress_remove(&exit.agent_name);
+
+                    if vm::should_restart(exit.exit_status)
+                        && let Some(manifest) = manifests.get(&exit.agent_name)
+                    {
+                        log(&format!(
+                            "cage: restarting '{}' after crash",
+                            exit.agent_name
+                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        let exec_path = format!("/agent/bin/{}", exit.agent_name);
+                        let secrets = request_secrets(
+                            &exit.agent_name,
+                            &manifest.capabilities.credential_refs,
+                        );
+                        match vm_mgr.start_agent(manifest, &exec_path, &secrets) {
+                            Ok(pid) => {
+                                log(&format!(
+                                    "cage: restarted '{}' (PID {pid})",
+                                    exit.agent_name
+                                ));
+                                notify_egress_add(
+                                    &exit.agent_name,
+                                    &manifest.capabilities.network.allow,
+                                );
+                            }
+                            Err(e) => log(&format!(
+                                "cage: failed to restart '{}': {e}",
+                                exit.agent_name
+                            )),
+                        }
+                    }
+                }
+            }
+            Ok(WaitStatus::Signaled(pid, signal, _)) => {
+                let pid_u32 = pid.as_raw() as u32;
+                if let Some(exit) = vm_mgr.handle_exit(pid_u32, 128 + signal as i32) {
+                    log(&format!(
+                        "cage: agent '{}' killed by signal {}",
+                        exit.agent_name, signal
+                    ));
+                    notify_egress_remove(&exit.agent_name);
+                }
+            }
+            Ok(WaitStatus::StillAlive) | Err(_) => break,
+            _ => continue,
+        }
+    }
 }
 
 /// Handle a command from the Unix socket.
@@ -237,22 +317,22 @@ fn load_manifests() -> HashMap<String, manifest::AgentManifest> {
     if let Ok(entries) = std::fs::read_dir(agent_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "toml") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    match manifest::parse(&content) {
-                        Ok(m) => {
-                            log(&format!(
-                                "cage: found agent '{}' v{}",
-                                m.agent.name, m.agent.version
-                            ));
-                            manifests.insert(m.agent.name.clone(), m);
-                        }
-                        Err(e) => {
-                            log(&format!(
-                                "cage: invalid manifest {}: {e}",
-                                path.display()
-                            ));
-                        }
+            if path.extension().is_some_and(|e| e == "toml")
+                && let Ok(content) = std::fs::read_to_string(&path)
+            {
+                match manifest::parse(&content) {
+                    Ok(m) => {
+                        log(&format!(
+                            "cage: found agent '{}' v{}",
+                            m.agent.name, m.agent.version
+                        ));
+                        manifests.insert(m.agent.name.clone(), m);
+                    }
+                    Err(e) => {
+                        log(&format!(
+                            "cage: invalid manifest {}: {e}",
+                            path.display()
+                        ));
                     }
                 }
             }
@@ -279,18 +359,18 @@ fn request_secrets(agent_name: &str, credential_refs: &[String]) -> HashMap<Stri
 
     match send_to_service(WARDEN_SOCKET, &request) {
         Ok(resp) => {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp) {
-                if let Some(secrets) = parsed.get("secrets").and_then(|s| s.as_object()) {
-                    let map: HashMap<String, String> = secrets
-                        .iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect();
-                    log(&format!(
-                        "cage: warden returned {} secret(s) for '{agent_name}'",
-                        map.len()
-                    ));
-                    return map;
-                }
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp)
+                && let Some(secrets) = parsed.get("secrets").and_then(|s| s.as_object())
+            {
+                let map: HashMap<String, String> = secrets
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect();
+                log(&format!(
+                    "cage: warden returned {} secret(s) for '{agent_name}'",
+                    map.len()
+                ));
+                return map;
             }
             log(&format!("cage: warden unexpected response for '{agent_name}': {resp}"));
             HashMap::new()
