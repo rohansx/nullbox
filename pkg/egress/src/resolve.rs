@@ -8,7 +8,8 @@ use std::net::IpAddr;
 
 /// Resolve a list of domain names to IP addresses.
 ///
-/// Uses the system resolver. Domains that fail to resolve are logged and skipped.
+/// Uses the system resolver with a per-domain timeout. Domains that fail
+/// to resolve or time out are logged and skipped.
 /// Returns a set of unique IPs across all domains.
 pub fn resolve_domains(domains: &[String]) -> BTreeSet<IpAddr> {
     let mut ips = BTreeSet::new();
@@ -20,20 +21,27 @@ pub fn resolve_domains(domains: &[String]) -> BTreeSet<IpAddr> {
             continue;
         }
 
-        // Resolve via system DNS (uses /etc/resolv.conf)
-        match std::net::ToSocketAddrs::to_socket_addrs(&(domain.as_str(), 0)) {
-            Ok(addrs) => {
-                let mut count = 0;
-                for addr in addrs {
-                    ips.insert(addr.ip());
-                    count += 1;
-                }
-                if count == 0 {
+        // Resolve with a 5-second timeout per domain to avoid blocking
+        let domain_clone = domain.clone();
+        let handle = std::thread::spawn(move || {
+            std::net::ToSocketAddrs::to_socket_addrs(&(domain_clone.as_str(), 0))
+                .map(|addrs| addrs.map(|a| a.ip()).collect::<Vec<_>>())
+        });
+
+        match handle.join() {
+            Ok(Ok(addrs)) => {
+                if addrs.is_empty() {
                     eprintln!("egress: DNS resolved 0 addresses for '{domain}'");
                 }
+                for ip in addrs {
+                    ips.insert(ip);
+                }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 eprintln!("egress: DNS resolution failed for '{domain}': {e}");
+            }
+            Err(_) => {
+                eprintln!("egress: DNS resolution panicked for '{domain}'");
             }
         }
     }

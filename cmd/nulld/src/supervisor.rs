@@ -179,6 +179,12 @@ impl Supervisor {
             };
 
             if should_restart {
+                // Reset backoff if service ran stably for >5 minutes
+                if let Some(last) = svc.last_start {
+                    if last.elapsed() > std::time::Duration::from_secs(300) {
+                        svc.restart_count = 0;
+                    }
+                }
                 let backoff = calculate_backoff(svc.restart_count);
                 svc.state = ServiceState::WaitingRestart;
                 svc.next_restart = Some(Instant::now() + backoff);

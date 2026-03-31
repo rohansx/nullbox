@@ -56,22 +56,39 @@ fn run_vm_child() {
 
     krun::set_log_level(2); // Warn
 
-    // Seccomp + Landlock sandbox, gated behind CAGE_ENFORCE=1.
+    // Seccomp + Landlock sandbox — default ON. Set CAGE_NO_SANDBOX=1 to skip.
     let pre_enter = || {
-        if std::env::var("CAGE_ENFORCE").is_err() {
+        if std::env::var("CAGE_NO_SANDBOX").is_ok() {
+            eprintln!("cage: [{}] sandbox disabled via CAGE_NO_SANDBOX", config.name);
             return;
         }
-        let Some(toml_json) = config.manifest_toml.as_deref() else { return };
-        let Ok(manifest) = serde_json::from_str::<cage::manifest::AgentManifest>(toml_json) else { return };
         let name = &config.name;
 
-        let sandbox = cage::fs_sandbox::build_sandbox(&config, &manifest);
-        if let Err(e) = cage::fs_sandbox::apply(&sandbox) {
-            eprintln!("cage: [{name}] Landlock: {e}");
-        }
-        let profile = cage::seccomp::build_profile(&manifest);
-        if let Err(e) = cage::seccomp::apply(&profile, false) {
-            eprintln!("cage: [{name}] seccomp: {e}");
+        // Landlock filesystem sandboxing
+        if let Some(toml_json) = config.manifest_toml.as_deref() {
+            if let Ok(manifest) = serde_json::from_str::<cage::manifest::AgentManifest>(toml_json) {
+                let sandbox = cage::fs_sandbox::build_sandbox(&config, &manifest);
+                match cage::fs_sandbox::apply(&sandbox) {
+                    Ok(()) => eprintln!("cage: [{name}] Landlock applied"),
+                    Err(cage::fs_sandbox::SandboxError::NotSupported) => {
+                        eprintln!("cage: [{name}] Landlock not supported — continuing without fs sandbox");
+                    }
+                    Err(e) => {
+                        eprintln!("cage: [{name}] Landlock FAILED: {e} — aborting");
+                        std::process::exit(1);
+                    }
+                }
+
+                // Seccomp syscall filtering (audit mode for now, kill mode when stable)
+                let profile = cage::seccomp::build_profile(&manifest);
+                match cage::seccomp::apply(&profile, false) {
+                    Ok(()) => eprintln!("cage: [{name}] seccomp applied (audit mode)"),
+                    Err(e) => {
+                        eprintln!("cage: [{name}] seccomp FAILED: {e} — aborting");
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
     };
 

@@ -80,6 +80,14 @@ pub fn generate_tsi_ruleset(agent_rules: &[TsiAgentRule]) -> Ruleset {
             "    ip daddr {cidr} drop comment \"block private ranges\"\n"
         ));
     }
+
+    // Block link-local (beyond metadata — SSRF via link-local services)
+    for cidr in blocklist::LINK_LOCAL_CIDRS {
+        let family = if cidr.contains(':') { "ip6" } else { "ip" };
+        rules.push_str(&format!(
+            "    {family} daddr {cidr} drop comment \"block link-local\"\n"
+        ));
+    }
     rules.push_str("\n");
 
     // Per-agent allow rules — resolved IPs from AGENT.toml domains
