@@ -15,6 +15,7 @@ use std::path::Path;
 
 const EGRESS_SOCKET: &str = "/run/egress.sock";
 const WARDEN_SOCKET: &str = "/run/warden.sock";
+const SENTINEL_SOCKET: &str = "/run/sentinel.sock";
 
 const SOCKET_PATH: &str = "/run/cage.sock";
 const AGENT_DIR: &str = "/agent";
@@ -142,6 +143,7 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(pid) => {
                     log(&format!("cage: auto-started '{name}' (PID {pid})"));
                     notify_egress_add(name, &manifest.capabilities.network.allow);
+                    notify_sentinel_register(manifest);
                 }
                 Err(e) => log(&format!("cage: failed to auto-start '{name}': {e}")),
             }
@@ -191,6 +193,7 @@ fn reap_children(
                         exit.agent_name, exit.exit_status
                     ));
                     notify_egress_remove(&exit.agent_name);
+                    notify_sentinel_deregister(&exit.agent_name);
 
                     if vm::should_restart(exit.exit_status)
                         && let Some(manifest) = manifests.get(&exit.agent_name)
@@ -232,6 +235,7 @@ fn reap_children(
                         exit.agent_name, signal
                     ));
                     notify_egress_remove(&exit.agent_name);
+                    notify_sentinel_deregister(&exit.agent_name);
                 }
             }
             Ok(WaitStatus::StillAlive) | Err(_) => break,
@@ -324,8 +328,8 @@ fn handle_start(
         Ok(pid) => {
             log(&format!("cage: started agent '{name}' in VM (PID {pid})"));
 
-            // Notify egress to allow this agent's declared domains
             notify_egress_add(name, &manifest.capabilities.network.allow);
+            notify_sentinel_register(manifest);
 
             serde_json::json!({"ok": true, "pid": pid})
         }
@@ -341,8 +345,8 @@ fn handle_stop(
         Ok(()) => {
             log(&format!("cage: stopped agent '{name}'"));
 
-            // Notify egress to revoke this agent's network access
             notify_egress_remove(name);
+            notify_sentinel_deregister(name);
 
             serde_json::json!({"ok": true})
         }
@@ -450,6 +454,49 @@ fn notify_egress_remove(agent_name: &str) {
     match send_to_service(EGRESS_SOCKET, &request) {
         Ok(resp) => log(&format!("cage: egress remove-agent '{agent_name}': {resp}")),
         Err(e) => log(&format!("cage: egress remove-agent '{agent_name}' failed: {e}")),
+    }
+}
+
+/// Register an agent with sentinel (LLM firewall) for inspection.
+fn notify_sentinel_register(manifest: &manifest::AgentManifest) {
+    let tools: serde_json::Map<String, serde_json::Value> = manifest
+        .tools
+        .iter()
+        .map(|(name, tool)| {
+            let risk_str = match tool.risk {
+                manifest::RiskLevel::Low => "low",
+                manifest::RiskLevel::Medium => "medium",
+                manifest::RiskLevel::High => "high",
+                manifest::RiskLevel::Critical => "critical",
+            };
+            (name.clone(), serde_json::Value::String(risk_str.to_string()))
+        })
+        .collect();
+
+    let request = serde_json::json!({
+        "method": "register",
+        "agent": manifest.agent.name,
+        "max_api_calls_per_hour": manifest.capabilities.max_api_calls_per_hour,
+        "max_tool_risk": "high",
+        "tools": tools,
+    });
+
+    match send_to_service(SENTINEL_SOCKET, &request) {
+        Ok(resp) => log(&format!("cage: sentinel register '{}': {resp}", manifest.agent.name)),
+        Err(e) => log(&format!("cage: sentinel register '{}' failed: {e}", manifest.agent.name)),
+    }
+}
+
+/// Deregister an agent from sentinel.
+fn notify_sentinel_deregister(agent_name: &str) {
+    let request = serde_json::json!({
+        "method": "deregister",
+        "agent": agent_name,
+    });
+
+    match send_to_service(SENTINEL_SOCKET, &request) {
+        Ok(resp) => log(&format!("cage: sentinel deregister '{agent_name}': {resp}")),
+        Err(e) => log(&format!("cage: sentinel deregister '{agent_name}' failed: {e}")),
     }
 }
 

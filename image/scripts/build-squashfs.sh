@@ -72,6 +72,24 @@ copy_binary ctxgraph
 copy_binary warden
 copy_binary cage
 
+# Sentinel is a separate project — build and copy from its own directory
+SENTINEL_DIR="${NULLBOX_ROOT}/../sentinel"
+if [[ -d "${SENTINEL_DIR}" ]]; then
+    SENTINEL_BIN="${SENTINEL_DIR}/target/${TARGET}/release/sentinel"
+    SENTINEL_BIN_FB="${SENTINEL_DIR}/target/release/sentinel"
+    if [[ -f "${SENTINEL_BIN}" ]]; then
+        cp "${SENTINEL_BIN}" "${BUILD_DIR}/system/bin/sentinel"
+        echo "  Copied sentinel (musl static)"
+    elif [[ -f "${SENTINEL_BIN_FB}" ]]; then
+        cp "${SENTINEL_BIN_FB}" "${BUILD_DIR}/system/bin/sentinel"
+        echo "  Copied sentinel (release)"
+    else
+        echo "  WARNING: sentinel binary not found — build it with: cd ../sentinel && cargo build --release"
+    fi
+else
+    echo "  WARNING: sentinel project not found at ${SENTINEL_DIR}"
+fi
+
 # cage links dynamically against libkrun — copy required shared libraries
 echo ">>> Copying shared libraries for cage..."
 mkdir -p "${BUILD_DIR}/usr/lib"
@@ -154,9 +172,15 @@ args = []
 depends_on = []
 restart = "always"
 
+[service.sentinel]
+binary = "/system/bin/sentinel"
+args = []
+depends_on = []
+restart = "always"
+
 [service.cage]
 binary = "/system/bin/cage"
-depends_on = ["egress", "ctxgraph", "warden"]
+depends_on = ["egress", "ctxgraph", "warden", "sentinel"]
 restart = "always"
 EOF
 echo "  Created nulld.toml"

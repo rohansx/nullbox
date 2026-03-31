@@ -108,6 +108,13 @@ fn builtin_services() -> Vec<ServiceDef> {
             restart: RestartPolicy::Always,
         },
         ServiceDef {
+            name: "sentinel".to_string(),
+            binary: "/system/bin/sentinel".to_string(),
+            args: vec![],
+            depends_on: vec![],
+            restart: RestartPolicy::Always,
+        },
+        ServiceDef {
             name: "cage".to_string(),
             binary: "/system/bin/cage".to_string(),
             args: vec![],
@@ -115,6 +122,7 @@ fn builtin_services() -> Vec<ServiceDef> {
                 "egress".to_string(),
                 "ctxgraph".to_string(),
                 "warden".to_string(),
+                "sentinel".to_string(),
             ],
             restart: RestartPolicy::Always,
         },
