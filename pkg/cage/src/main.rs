@@ -16,6 +16,7 @@ use std::path::Path;
 const EGRESS_SOCKET: &str = "/run/egress.sock";
 const WARDEN_SOCKET: &str = "/run/warden.sock";
 const SENTINEL_SOCKET: &str = "/run/sentinel.sock";
+const WATCHER_SOCKET: &str = "/run/watcher.sock";
 
 const SOCKET_PATH: &str = "/run/cage.sock";
 const AGENT_DIR: &str = "/agent";
@@ -144,8 +145,12 @@ fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
                     log(&format!("cage: auto-started '{name}' (PID {pid})"));
                     notify_egress_add(name, &manifest.capabilities.network.allow);
                     notify_sentinel_register(manifest);
+                    audit_record(name, "start", "success", &format!("PID {pid}"));
                 }
-                Err(e) => log(&format!("cage: failed to auto-start '{name}': {e}")),
+                Err(e) => {
+                    log(&format!("cage: failed to auto-start '{name}': {e}"));
+                    audit_record(name, "start", "failure", &e.to_string());
+                }
             }
         } else {
             log(&format!("cage: skipping '{name}' — no rootfs at {rootfs_path}"));
@@ -194,6 +199,8 @@ fn reap_children(
                     ));
                     notify_egress_remove(&exit.agent_name);
                     notify_sentinel_deregister(&exit.agent_name);
+                    let action = if exit.exit_status == 0 { "stop" } else { "crash" };
+                    audit_record(&exit.agent_name, action, "success", &format!("exit={}", exit.exit_status));
 
                     if vm::should_restart(exit.exit_status)
                         && let Some(manifest) = manifests.get(&exit.agent_name)
@@ -236,6 +243,7 @@ fn reap_children(
                     ));
                     notify_egress_remove(&exit.agent_name);
                     notify_sentinel_deregister(&exit.agent_name);
+                    audit_record(&exit.agent_name, "crash", "failure", &format!("signal={signal}"));
                 }
             }
             Ok(WaitStatus::StillAlive) | Err(_) => break,
@@ -327,13 +335,15 @@ fn handle_start(
     match vm_mgr.start_agent(manifest, &exec_path, &secrets) {
         Ok(pid) => {
             log(&format!("cage: started agent '{name}' in VM (PID {pid})"));
-
             notify_egress_add(name, &manifest.capabilities.network.allow);
             notify_sentinel_register(manifest);
-
+            audit_record(name, "start", "success", &format!("PID {pid}"));
             serde_json::json!({"ok": true, "pid": pid})
         }
-        Err(e) => serde_json::json!({"error": e.to_string()}),
+        Err(e) => {
+            audit_record(name, "start", "failure", &e.to_string());
+            serde_json::json!({"error": e.to_string()})
+        }
     }
 }
 
@@ -344,10 +354,9 @@ fn handle_stop(
     match vm_mgr.stop_agent(name) {
         Ok(()) => {
             log(&format!("cage: stopped agent '{name}'"));
-
             notify_egress_remove(name);
             notify_sentinel_deregister(name);
-
+            audit_record(name, "stop", "success", "");
             serde_json::json!({"ok": true})
         }
         Err(e) => serde_json::json!({"error": e.to_string()}),
@@ -498,6 +507,20 @@ fn notify_sentinel_deregister(agent_name: &str) {
         Ok(resp) => log(&format!("cage: sentinel deregister '{agent_name}': {resp}")),
         Err(e) => log(&format!("cage: sentinel deregister '{agent_name}' failed: {e}")),
     }
+}
+
+/// Record an audit event in the watcher log.
+fn audit_record(agent: &str, action: &str, outcome: &str, detail: &str) {
+    let request = serde_json::json!({
+        "method": "record",
+        "agent": agent,
+        "action": action,
+        "outcome": outcome,
+        "detail": detail,
+    });
+
+    // Best-effort — don't block on watcher failures
+    let _ = send_to_service(WATCHER_SOCKET, &request);
 }
 
 /// Send a JSON request to a Unix socket and read one line of response.

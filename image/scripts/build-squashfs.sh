@@ -90,6 +90,24 @@ else
     echo "  WARNING: sentinel project not found at ${SENTINEL_DIR}"
 fi
 
+# Watcher is a separate project — build and copy from its own directory
+WATCHER_DIR="${NULLBOX_ROOT}/../watcher"
+if [[ -d "${WATCHER_DIR}" ]]; then
+    WATCHER_BIN="${WATCHER_DIR}/target/${TARGET}/release/watcher"
+    WATCHER_BIN_FB="${WATCHER_DIR}/target/release/watcher"
+    if [[ -f "${WATCHER_BIN}" ]]; then
+        cp "${WATCHER_BIN}" "${BUILD_DIR}/system/bin/watcher"
+        echo "  Copied watcher (musl static)"
+    elif [[ -f "${WATCHER_BIN_FB}" ]]; then
+        cp "${WATCHER_BIN_FB}" "${BUILD_DIR}/system/bin/watcher"
+        echo "  Copied watcher (release)"
+    else
+        echo "  WARNING: watcher binary not found — build it with: cd ../watcher && cargo build --release"
+    fi
+else
+    echo "  WARNING: watcher project not found at ${WATCHER_DIR}"
+fi
+
 # cage links dynamically against libkrun — copy required shared libraries
 echo ">>> Copying shared libraries for cage..."
 mkdir -p "${BUILD_DIR}/usr/lib"
@@ -178,9 +196,15 @@ args = []
 depends_on = []
 restart = "always"
 
+[service.watcher]
+binary = "/system/bin/watcher"
+args = []
+depends_on = []
+restart = "always"
+
 [service.cage]
 binary = "/system/bin/cage"
-depends_on = ["egress", "ctxgraph", "warden", "sentinel"]
+depends_on = ["egress", "ctxgraph", "warden", "sentinel", "watcher"]
 restart = "always"
 EOF
 echo "  Created nulld.toml"
