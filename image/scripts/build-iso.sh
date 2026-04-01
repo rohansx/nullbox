@@ -65,9 +65,10 @@ else
 fi
 
 cat > "${BUILD_DIR}/boot/grub/grub.cfg" << GRUB_EOF
-serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1
-terminal_input serial console
-terminal_output serial console
+insmod serial
+if serial --speed=115200 --unit=0; then
+    terminal_output serial console
+fi
 
 set timeout=3
 set default=0
