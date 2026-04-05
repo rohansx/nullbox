@@ -2,25 +2,29 @@
 #
 # install.sh — One-command NullBox installer
 #
+# What it does:
+#   1. Installs QEMU (if not present)
+#   2. Downloads the NullBox ISO (64MB)
+#   3. Runs NullBox in a VM on your existing OS
+#   4. Opens the web dashboard in your browser
+#
+# Your OS is NOT replaced. NullBox runs inside a lightweight VM.
+#
 # Usage:
 #   curl -fsSL https://nullbox.dev/install.sh | bash
-#   # or
-#   ./install.sh [--iso /path/to/nullbox.iso] [--memory 4096] [--cpus 4]
+#   ./install.sh [--iso path/to/nullbox.iso] [--memory 4096] [--cpus 4]
 #
-# Supports:
-#   - Linux (QEMU/KVM via libvirt + virt-manager)
-#   - macOS (UTM or QEMU via Homebrew)
+# Supports: Linux (x86_64 with KVM), macOS (Intel + Apple Silicon)
 
 set -euo pipefail
 
 NULLBOX_VERSION="0.1.0"
 ISO_URL="https://github.com/rohansx/nullbox/releases/download/v${NULLBOX_VERSION}/nullbox-x86_64.iso"
-VM_NAME="nullbox"
+NULLBOX_DIR="${HOME}/.nullbox"
 MEMORY=4096
 CPUS=4
 ISO_PATH=""
 
-# Parse args
 for arg in "$@"; do
     case "${arg}" in
         --iso=*) ISO_PATH="${arg#*=}" ;;
@@ -32,9 +36,10 @@ done
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
-echo -e "${CYAN}"
+echo -e "${CYAN}${BOLD}"
 echo "  _   _       _ _ ____            "
 echo " | \ | |_   _| | | __ )  _____  __"
 echo " |  \| | | | | | |  _ \ / _ \ \/ /"
@@ -46,191 +51,183 @@ echo "  v${NULLBOX_VERSION}"
 echo ""
 
 OS="$(uname -s)"
+ARCH="$(uname -m)"
 
-# ── Download ISO ──────────────────────────────────────────────────────────
+# ── Install QEMU ─────────────────────────────────────────────────────────
 
-download_iso() {
-    local dest="$1"
-    if [[ -n "${ISO_PATH}" && -f "${ISO_PATH}" ]]; then
-        echo "  Using local ISO: ${ISO_PATH}"
-        cp "${ISO_PATH}" "${dest}"
-        return
+install_qemu() {
+    echo -e "${CYAN}>>> Installing QEMU...${NC}"
+
+    case "${OS}" in
+        Linux)
+            if command -v pacman &>/dev/null; then
+                sudo pacman -S --needed --noconfirm qemu-system-x86 2>/dev/null
+            elif command -v apt-get &>/dev/null; then
+                sudo apt-get install -y qemu-system-x86 qemu-utils 2>/dev/null
+            elif command -v dnf &>/dev/null; then
+                sudo dnf install -y qemu-system-x86-core 2>/dev/null
+            elif command -v zypper &>/dev/null; then
+                sudo zypper install -y qemu-x86 2>/dev/null
+            else
+                echo -e "${RED}Cannot auto-install QEMU. Install it manually:${NC}"
+                echo "  https://www.qemu.org/download/"
+                exit 1
+            fi
+            ;;
+        Darwin)
+            if command -v brew &>/dev/null; then
+                brew install qemu
+            else
+                echo -e "${RED}Homebrew required. Install it:${NC}"
+                echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+                echo "  Then run this script again."
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+# ── Check prerequisites ──────────────────────────────────────────────────
+
+echo -e "${CYAN}>>> Checking prerequisites...${NC}"
+
+# QEMU
+if ! command -v qemu-system-x86_64 &>/dev/null; then
+    install_qemu
+fi
+
+QEMU_VER=$(qemu-system-x86_64 --version | head -1)
+echo "  QEMU: ${QEMU_VER}"
+
+# KVM (Linux only)
+ACCEL="tcg"
+if [[ "${OS}" == "Linux" ]]; then
+    if [[ -e /dev/kvm ]]; then
+        ACCEL="kvm"
+        echo -e "  KVM:  ${GREEN}available${NC} (native speed)"
+    else
+        echo -e "  KVM:  ${RED}not available${NC} (will run slower)"
+        echo "  Enable VT-x/AMD-V in BIOS for best performance."
     fi
+elif [[ "${OS}" == "Darwin" ]]; then
+    # macOS: use HVF on Intel, TCG on Apple Silicon (x86 emulation)
+    if [[ "${ARCH}" == "x86_64" ]]; then
+        ACCEL="hvf"
+        echo -e "  HVF:  ${GREEN}available${NC} (Intel Mac)"
+    else
+        echo "  Note: Apple Silicon — x86 emulation (slower). ARM64 ISO coming soon."
+    fi
+fi
+echo ""
 
-    echo "  Downloading NullBox ISO (~64MB)..."
+# ── Download ISO ─────────────────────────────────────────────────────────
+
+mkdir -p "${NULLBOX_DIR}"
+ISO_DEST="${NULLBOX_DIR}/nullbox-x86_64.iso"
+
+if [[ -n "${ISO_PATH}" && -f "${ISO_PATH}" ]]; then
+    echo -e "${CYAN}>>> Using local ISO: ${ISO_PATH}${NC}"
+    cp "${ISO_PATH}" "${ISO_DEST}"
+elif [[ -f "${ISO_DEST}" ]]; then
+    echo -e "${CYAN}>>> ISO already downloaded: ${ISO_DEST}${NC}"
+else
+    echo -e "${CYAN}>>> Downloading NullBox ISO (~64MB)...${NC}"
     if command -v curl &>/dev/null; then
-        curl -fSL -o "${dest}" "${ISO_URL}"
+        curl -fSL --progress-bar -o "${ISO_DEST}" "${ISO_URL}"
     elif command -v wget &>/dev/null; then
-        wget -q -O "${dest}" "${ISO_URL}"
-    else
-        echo -e "${RED}error: curl or wget required${NC}"
-        exit 1
+        wget -q --show-progress -O "${ISO_DEST}" "${ISO_URL}"
     fi
-    echo -e "  ${GREEN}Downloaded${NC}"
-}
+fi
+echo ""
 
-# ── Linux Install ─────────────────────────────────────────────────────────
+# ── Create launcher script ───────────────────────────────────────────────
 
-install_linux() {
-    echo "  Platform: Linux"
-    echo ""
+LAUNCHER="${NULLBOX_DIR}/start.sh"
+cat > "${LAUNCHER}" << LAUNCHER_EOF
+#!/usr/bin/env bash
+# NullBox launcher — run with: ~/.nullbox/start.sh
+ISO="${ISO_DEST}"
+MEMORY=${MEMORY}
+CPUS=${CPUS}
+ACCEL=${ACCEL}
 
-    # Check KVM
-    if [[ ! -e /dev/kvm ]]; then
-        echo -e "${RED}error: KVM not available. Enable VT-x/AMD-V in BIOS.${NC}"
-        exit 1
+echo "Starting NullBox v${NULLBOX_VERSION}..."
+echo "  Dashboard: http://localhost:8080"
+echo "  Memory:    \${MEMORY}MB"
+echo "  CPUs:      \${CPUS}"
+echo "  Accel:     \${ACCEL}"
+echo ""
+echo "  Press Ctrl-A X to stop."
+echo ""
+
+exec qemu-system-x86_64 \\
+    -accel \${ACCEL} \\
+    -m \${MEMORY} \\
+    -cpu \$([ "\${ACCEL}" = "kvm" ] && echo "host" || echo "max") \\
+    -smp \${CPUS} \\
+    -nographic \\
+    -serial mon:stdio \\
+    -boot d \\
+    -cdrom "\${ISO}" \\
+    -nic user,model=virtio,hostfwd=tcp::8080-:8080,hostfwd=tcp::19100-:9100,hostfwd=tcp::19200-:9200
+LAUNCHER_EOF
+chmod +x "${LAUNCHER}"
+
+# ── Create stop script ───────────────────────────────────────────────────
+
+cat > "${NULLBOX_DIR}/stop.sh" << 'STOP_EOF'
+#!/usr/bin/env bash
+pkill -f "qemu-system.*nullbox" 2>/dev/null && echo "NullBox stopped." || echo "NullBox not running."
+STOP_EOF
+chmod +x "${NULLBOX_DIR}/stop.sh"
+
+# ── Start NullBox ────────────────────────────────────────────────────────
+
+echo -e "${CYAN}>>> Starting NullBox...${NC}"
+echo ""
+
+# Run in background
+nohup "${LAUNCHER}" > "${NULLBOX_DIR}/nullbox.log" 2>&1 &
+QEMU_PID=$!
+echo "${QEMU_PID}" > "${NULLBOX_DIR}/nullbox.pid"
+
+# Wait for dashboard to come up
+echo "  Waiting for services..."
+READY=false
+for i in $(seq 1 60); do
+    if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 2>/dev/null && exec 3>&-' 2>/dev/null; then
+        READY=true
+        echo -e "  ${GREEN}Ready in ${i}s${NC}"
+        break
     fi
-
-    # Install deps
-    if command -v pacman &>/dev/null; then
-        echo "  Installing virt-manager (pacman)..."
-        sudo pacman -S --needed --noconfirm virt-manager qemu-desktop libvirt dnsmasq edk2-ovmf python-gobject 2>/dev/null || true
-    elif command -v apt &>/dev/null; then
-        echo "  Installing virt-manager (apt)..."
-        sudo apt-get install -y virt-manager qemu-kvm libvirt-daemon-system 2>/dev/null || true
-    elif command -v dnf &>/dev/null; then
-        echo "  Installing virt-manager (dnf)..."
-        sudo dnf install -y virt-manager qemu-kvm libvirt 2>/dev/null || true
-    else
-        echo "  Please install virt-manager manually for your distro"
+    if ! kill -0 "${QEMU_PID}" 2>/dev/null; then
+        echo -e "${RED}  QEMU exited. Check ${NULLBOX_DIR}/nullbox.log${NC}"
+        break
     fi
+    sleep 1
+done
 
-    # Enable libvirt
-    sudo systemctl enable --now libvirtd 2>/dev/null || true
-    sudo virsh net-start default 2>/dev/null || true
-
-    # Download ISO
-    ISO_DEST="/var/lib/libvirt/images/nullbox.iso"
-    sudo mkdir -p /var/lib/libvirt/images
-    download_iso "/tmp/nullbox.iso"
-    sudo mv /tmp/nullbox.iso "${ISO_DEST}"
-    sudo chmod 644 "${ISO_DEST}"
-
-    # Remove existing VM
-    sudo virsh destroy "${VM_NAME}" 2>/dev/null || true
-    sudo virsh undefine "${VM_NAME}" 2>/dev/null || true
-
-    # Create VM
-    echo "  Creating NullBox VM (${MEMORY}MB RAM, ${CPUS} CPUs)..."
-    sudo virt-install \
-        --name "${VM_NAME}" \
-        --memory "${MEMORY}" \
-        --vcpus "${CPUS}" \
-        --cpu host-passthrough \
-        --cdrom "${ISO_DEST}" \
-        --os-variant linux2022 \
-        --network network=default,model=virtio \
-        --graphics spice \
-        --video virtio \
-        --disk none \
-        --noautoconsole \
-        --boot cdrom 2>/dev/null
-
+echo ""
+if [[ "${READY}" == "true" ]]; then
+    echo -e "${GREEN}${BOLD}  NullBox is running!${NC}"
     echo ""
-    echo -e "${GREEN}  NullBox is running!${NC}"
+    echo "  Dashboard:  http://localhost:8080"
     echo ""
-    echo "  Open the console:"
-    echo "    virt-manager"
+    echo "  Commands:"
+    echo "    ~/.nullbox/start.sh    Start NullBox"
+    echo "    ~/.nullbox/stop.sh     Stop NullBox"
     echo ""
-    echo "  Or connect via serial:"
-    echo "    sudo virsh console nullbox"
-    echo ""
-    echo "  Stop:"
-    echo "    sudo virsh destroy nullbox"
-    echo ""
-    echo "  Start again:"
-    echo "    sudo virsh start nullbox"
-}
-
-# ── macOS Install ─────────────────────────────────────────────────────────
-
-install_macos() {
-    echo "  Platform: macOS"
+    echo "  Logs: ~/.nullbox/nullbox.log"
     echo ""
 
-    ARCH="$(uname -m)"
-
-    # Check for UTM first (preferred on macOS)
-    if [[ -d "/Applications/UTM.app" ]]; then
-        echo "  Found UTM — using it for NullBox VM"
-        install_macos_utm
-        return
+    # Open browser (best effort)
+    if command -v xdg-open &>/dev/null; then
+        xdg-open "http://localhost:8080" 2>/dev/null &
+    elif command -v open &>/dev/null; then
+        open "http://localhost:8080" 2>/dev/null &
     fi
-
-    # Check for QEMU via Homebrew
-    if command -v qemu-system-x86_64 &>/dev/null; then
-        echo "  Found QEMU — using it for NullBox VM"
-        install_macos_qemu
-        return
-    fi
-
-    # Neither found — install UTM
-    echo "  Installing UTM (VM manager for macOS)..."
-    if command -v brew &>/dev/null; then
-        brew install --cask utm
-        install_macos_utm
-    else
-        echo ""
-        echo "  Install UTM from: https://mac.getutm.app/"
-        echo "  Or install Homebrew: https://brew.sh"
-        echo ""
-        echo "  Then run this script again."
-        exit 1
-    fi
-}
-
-install_macos_utm() {
-    local iso_dest="${HOME}/Library/Containers/com.utmapp.UTM/Data/Documents/nullbox.iso"
-    mkdir -p "$(dirname "${iso_dest}")" 2>/dev/null || true
-
-    # For UTM, just download the ISO and tell the user to import it
-    download_iso "${HOME}/Downloads/nullbox.iso"
-
-    echo ""
-    echo -e "${GREEN}  ISO downloaded to ~/Downloads/nullbox.iso${NC}"
-    echo ""
-    echo "  To create the VM in UTM:"
-    echo "  1. Open UTM"
-    echo "  2. Click '+' → Virtualize (Intel Mac) or Emulate (Apple Silicon)"
-    echo "  3. Select 'Linux'"
-    echo "  4. Browse to ~/Downloads/nullbox.iso"
-    echo "  5. Set RAM to ${MEMORY}MB, CPUs to ${CPUS}"
-    echo "  6. Uncheck 'Enable hardware OpenGL acceleration'"
-    echo "  7. Click 'Save' then 'Play'"
-    echo ""
-    echo "  Note: On Apple Silicon, NullBox runs in emulation mode (slower)."
-    echo "  For native ARM64 support, build with: ./kernel/scripts/build-kernel.sh --arch aarch64"
-}
-
-install_macos_qemu() {
-    download_iso "/tmp/nullbox.iso"
-
-    echo ""
-    echo -e "${GREEN}  Starting NullBox in QEMU...${NC}"
-    echo ""
-
-    local accel="tcg"
-    if [[ "$(uname -m)" == "x86_64" ]]; then
-        # Intel Mac — can use HVF
-        accel="hvf"
-    fi
-
-    echo "  Run:"
-    echo "    qemu-system-x86_64 \\"
-    echo "      -accel ${accel} -m ${MEMORY} -smp ${CPUS} \\"
-    echo "      -nographic -serial mon:stdio \\"
-    echo "      -cdrom /tmp/nullbox.iso \\"
-    echo "      -nic user,model=virtio,hostfwd=tcp::19100-:9100"
-}
-
-# ── Dispatch ──────────────────────────────────────────────────────────────
-
-case "${OS}" in
-    Linux)  install_linux ;;
-    Darwin) install_macos ;;
-    *)
-        echo -e "${RED}Unsupported platform: ${OS}${NC}"
-        echo "NullBox supports Linux and macOS."
-        exit 1
-        ;;
-esac
+else
+    echo -e "${RED}  NullBox did not start in time.${NC}"
+    echo "  Check: ${NULLBOX_DIR}/nullbox.log"
+    echo "  Try: ${LAUNCHER}"
+fi
